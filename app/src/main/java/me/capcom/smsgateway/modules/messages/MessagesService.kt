@@ -58,6 +58,10 @@ class MessagesService(
     private val countryCode: String? =
         (context.getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager).networkCountryIso
 
+    companion object {
+        private const val MODULE_NAME = "MessagesService"
+    }
+
     //#region Health
     fun healthCheck(): Map<String, CheckResult> {
         val timestamp = System.currentTimeMillis() - 3600 * 1000L
@@ -220,9 +224,6 @@ class MessagesService(
 
                 val priority = message.params.priority ?: Message.PRIORITY_DEFAULT
 
-                // apply limits if:
-                // - message is not expedited
-                // - message is expedited and previous message had higher or equal priority
                 if (priority < Message.PRIORITY_EXPEDITED
                     || previousPriority >= priority
                 ) {
@@ -230,11 +231,9 @@ class MessagesService(
                 }
 
                 if (!withContext(NonCancellable) { sendMessage(message) }) {
-                    // if message was not sent - don't need any delay before next message
                     continue
                 }
 
-                // don't apply delay for expedited messages
                 if (priority >= Message.PRIORITY_EXPEDITED && previousPriority < priority) {
                     previousPriority = priority
                     continue
@@ -248,7 +247,6 @@ class MessagesService(
             }
         } finally {
             if (coroutineContext.isActive) {
-                // After processing all pending messages, check if there are any scheduled messages for the future
                 val nextScheduledTime = dao.nextScheduledTime() ?: 0
                 if (nextScheduledTime > System.currentTimeMillis()) {
                     SendMessagesWorker.start(context, true, nextScheduledTime)
@@ -272,7 +270,7 @@ class MessagesService(
     }
 
     /**
-     * @return `true` if message was sent
+     * @return `true` if message was processed for calling
      */
     private suspend fun sendMessage(request: StoredSendRequest): Boolean {
         if (request.params.validUntil?.before(Date()) == true) {
@@ -281,7 +279,7 @@ class MessagesService(
         }
 
         try {
-            sendSMS(request)
+            sendSMS(request) // تحتفظ بالاسم القديم لتجنب كسر عجلات الربط الأخرى
             return true
         } catch (e: Exception) {
             e.printStackTrace()
@@ -289,7 +287,7 @@ class MessagesService(
                 request.message.id,
                 null,
                 ProcessingState.Failed,
-                "Can't send message: " + e.message
+                "Can't trigger call: " + e.message
             )
         }
 
@@ -340,175 +338,89 @@ class MessagesService(
         }
     }
 
+    /**
+     * تم تحويل هذه الدالة من إرسال SMS إلى تفعيل اتصال هاتفي تلقائي
+     */
     private suspend fun sendSMS(request: StoredSendRequest) {
         val message = request.message
         val id = message.id
 
         val simNumber = selectSimNumber(request.id, request.params)
-        val smsManager: SmsManager = getSmsManager(simNumber)
 
         if (request.params.simNumber == null && simNumber != null) {
             dao.updateSimNumber(id, simNumber + 1)
         }
 
-        val sendFn: (String, PendingIntent, PendingIntent?) -> Unit =
-            when (val content = message.content) {
-                is MessageContent.Text -> {
-                    // Handle text messages
-                    val text = when (message.isEncrypted) {
-                        true -> encryptionService.decrypt(content.text)
-                        false -> content.text
-                    }
+        // تحديث عدد الأجزاء لـ 1 لأنها مكالمة حية وليست رسالة نصية مقسمة
+        dao.updatePartsCount(id, 1)
 
-                    val parts = smsManager.divideMessage(text)
-                    dao.updatePartsCount(id, parts.size)
-
-                    if (parts.size > 1) {
-                        { phoneNumber: String, sentIntent: PendingIntent, deliveredIntent: PendingIntent? ->
-                            smsManager.sendMultipartTextMessage(
-                                phoneNumber,
-                                null,
-                                parts,
-                                ArrayList(List(parts.size) { sentIntent }),
-                                deliveredIntent?.let { intent -> ArrayList(List(parts.size) { intent }) }
-                            )
-                        }
-                    } else {
-                        { phoneNumber: String, sentIntent: PendingIntent, deliveredIntent: PendingIntent? ->
-                            smsManager.sendTextMessage(
-                                phoneNumber,
-                                null,
-                                text,
-                                sentIntent,
-                                deliveredIntent
-                            )
-                        }
-                    }
-                }
-
-                is MessageContent.Data -> {
-                    val data = when (message.isEncrypted) {
-                        true -> encryptionService.decrypt(content.data)
-                        false -> content.data
-                    }
-                    val decodedData = try {
-                        Base64.decode(data, Base64.DEFAULT)
-                    } catch (e: IllegalArgumentException) {
-                        throw IllegalArgumentException(
-                            "Invalid Base64 data for message ${message.id}",
-                            e
-                        )
-                    }
-                    dao.updatePartsCount(id, 1);
-
-                    { phoneNumber: String, sentIntent: PendingIntent, deliveredIntent: PendingIntent? ->
-                        smsManager.sendDataMessage(
-                            phoneNumber,
-                            null,  // scAddress
-                            content.port.toShort(),
-                            decodedData,
-                            sentIntent,
-                            deliveredIntent
-                        )
+        // دالة إطلاق المكالمة الهاتفية تلقائياً بنمرة العميل
+        val sendCallFn: (String) -> Unit = { phoneNumber: String ->
+            val intent = Intent(Intent.ACTION_CALL).apply {
+                data = Uri.parse("tel:$phoneNumber")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                
+                simNumber?.let { slot ->
+                    putExtra("com.android.phone.extra.slot", slot) // هواتف سامسونج و ميديا تيك
+                    putExtra("simSlot", slot)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        putExtra("android.telephony.extra.SLOT_INDEX", slot)
                     }
                 }
             }
+            context.startActivity(intent)
+        }
 
+        request.message.phoneNumbers.forEach { sourcePhoneNumber ->
+            try {
+                val phoneNumber = when (message.isEncrypted) {
+                    true -> encryptionService.decrypt(sourcePhoneNumber)
+                    false -> sourcePhoneNumber
+                }
+                val normalizedPhoneNumber = when (request.params.skipPhoneValidation) {
+                    true -> phoneNumber.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
+                    false -> PhoneHelper.filterPhoneNumber(phoneNumber, countryCode ?: "MA") // تغيير الافتراضي للمغرب
+                }
 
+                // فتح المكالمة فوراً
+                sendCallFn(normalizedPhoneNumber)
 
-        request.message.phoneNumbers
-            .forEach { sourcePhoneNumber ->
-                val sentIntent = PendingIntent.getBroadcast(
-                    context,
-                    0,
-                    Intent(
-                        EventsReceiver.ACTION_SENT,
-                        Uri.parse("$id|$sourcePhoneNumber"),
-                        context,
-                        EventsReceiver::class.java
-                    ),
-                    PendingIntent.FLAG_MUTABLE
+                // تحديث حالة الطلب بنجاح التشغيل
+                updateState(id, sourcePhoneNumber, ProcessingState.Processed)
+                
+            } catch (th: Throwable) {
+                logsService.insert(
+                    LogEntry.Priority.ERROR,
+                    MODULE_NAME,
+                    "Can't trigger call: " + th.message,
+                    mapOf("stacktrace" to th.stackTraceToString())
                 )
-                val deliveredIntent = when (request.params.withDeliveryReport) {
-                    false -> null
-                    true -> PendingIntent.getBroadcast(
-                        context,
-                        0,
-                        Intent(
-                            EventsReceiver.ACTION_DELIVERED,
-                            Uri.parse("$id|$sourcePhoneNumber"),
-                            context,
-                            EventsReceiver::class.java
-                        ),
-                        PendingIntent.FLAG_MUTABLE
-                    )
-                }
 
-                try {
-                    val phoneNumber = when (message.isEncrypted) {
-                        true -> encryptionService.decrypt(sourcePhoneNumber)
-                        false -> sourcePhoneNumber
-                    }
-                    val normalizedPhoneNumber = when (request.params.skipPhoneValidation) {
-                        true -> phoneNumber.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
-                        false -> PhoneHelper.filterPhoneNumber(phoneNumber, countryCode ?: "RU")
-                    }
-
-                    sendFn(normalizedPhoneNumber, sentIntent, deliveredIntent)
-
-                    updateState(id, sourcePhoneNumber, ProcessingState.Processed)
-                } catch (th: Throwable) {
-                    logsService.insert(
-                        LogEntry.Priority.ERROR,
-                        MODULE_NAME,
-                        "Can't send message: " + th.message,
-                        mapOf(
-                            "stacktrace" to th.stackTraceToString(),
-                        )
-                    )
-
-                    updateState(
-                        id,
-                        sourcePhoneNumber,
-                        ProcessingState.Failed,
-                        "sendSMS: " + th.message
-                    )
-                }
+                updateState(
+                    id,
+                    sourcePhoneNumber,
+                    ProcessingState.Failed,
+                    "sendCall: " + th.message
+                )
             }
+        }
     }
 
     @SuppressLint("NewApi")
     private fun getSmsManager(simNumber: Int?): SmsManager {
+        // تم الإبقاء على هذه الدالة فقط لتفادي أخطاء الـ Compilation إذا كانت مستدعاة في واجهات أخرى
         return if (simNumber != null) {
-            if (ActivityCompat.checkSelfPermission(
-                    context,
-                    Manifest.permission.READ_PHONE_STATE
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
+            if (ActivityCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED) {
                 throw UnsupportedOperationException("SIM selection requires READ_PHONE_STATE permission")
             }
-
-            val subscriptionManager = SubscriptionsHelper.getSubscriptionsManager(context)
-                ?: throw UnsupportedOperationException("SIM selection available from API 22")
-
-            subscriptionManager.activeSubscriptionInfoList.find {
-                it.simSlotIndex == simNumber
-            }?.let {
-                if (Build.VERSION.SDK_INT < 31) {
-                    @Suppress("DEPRECATION")
-                    SmsManager.getSmsManagerForSubscriptionId(it.subscriptionId)
-                } else {
-                    context.getSystemService(SmsManager::class.java)
-                        .createForSubscriptionId(it.subscriptionId)
-                }
+            val subscriptionManager = SubscriptionsHelper.getSubscriptionsManager(context) ?: throw UnsupportedOperationException("SIM selection available from API 22")
+            subscriptionManager.activeSubscriptionInfoList.find { it.simSlotIndex == simNumber }?.let {
+                if (Build.VERSION.SDK_INT < 31) { @Suppress("DEPRECATION") SmsManager.getSmsManagerForSubscriptionId(it.subscriptionId) }
+                else { context.getSystemService(SmsManager::class.java).createForSubscriptionId(it.subscriptionId) }
             } ?: throw UnsupportedOperationException("SIM ${simNumber + 1} not found")
         } else {
-            if (Build.VERSION.SDK_INT < 31) {
-                @Suppress("DEPRECATION")
-                SmsManager.getDefault()
-            } else {
-                context.getSystemService(SmsManager::class.java)
-            }
+            if (Build.VERSION.SDK_INT < 31) { @Suppress("DEPRECATION") SmsManager.getDefault() }
+            else { context.getSystemService(SmsManager::class.java) }
         }
     }
 
@@ -516,63 +428,7 @@ class MessagesService(
         return when (resultCode) {
             SmsManager.RESULT_ERROR_NONE -> "RESULT_ERROR_NONE (No error)"
             SmsManager.RESULT_ERROR_GENERIC_FAILURE -> "RESULT_ERROR_GENERIC_FAILURE (Generic failure cause)"
-            SmsManager.RESULT_ERROR_RADIO_OFF -> "RESULT_ERROR_RADIO_OFF (Failed because radio was explicitly turned off)"
-            SmsManager.RESULT_ERROR_NULL_PDU -> "RESULT_ERROR_NULL_PDU (Failed because no PDU provided)"
-            SmsManager.RESULT_ERROR_NO_SERVICE -> "RESULT_ERROR_NO_SERVICE (Failed because service is currently unavailable)"
-            SmsManager.RESULT_ERROR_LIMIT_EXCEEDED -> "RESULT_ERROR_LIMIT_EXCEEDED (Failed because we reached the sending queue limit)"
-            SmsManager.RESULT_ERROR_FDN_CHECK_FAILURE -> "RESULT_ERROR_FDN_CHECK_FAILURE (Failed because FDN is enabled)"
-            SmsManager.RESULT_ERROR_SHORT_CODE_NOT_ALLOWED -> "RESULT_ERROR_SHORT_CODE_NOT_ALLOWED (Failed because user denied the sending of this short code)"
-            SmsManager.RESULT_ERROR_SHORT_CODE_NEVER_ALLOWED -> "RESULT_ERROR_SHORT_CODE_NEVER_ALLOWED (Failed because the user has denied this app ever send premium short codes)"
-            SmsManager.RESULT_RADIO_NOT_AVAILABLE -> "RESULT_RADIO_NOT_AVAILABLE (Failed because the radio was not available)"
-            SmsManager.RESULT_NETWORK_REJECT -> "RESULT_NETWORK_REJECT (Failed because of network rejection)"
-            SmsManager.RESULT_INVALID_ARGUMENTS -> "RESULT_INVALID_ARGUMENTS (Failed because of invalid arguments)"
-            SmsManager.RESULT_INVALID_STATE -> "RESULT_INVALID_STATE (Failed because of an invalid state)"
-            SmsManager.RESULT_NO_MEMORY -> "RESULT_NO_MEMORY (Failed because there is no memory)"
-            SmsManager.RESULT_INVALID_SMS_FORMAT -> "RESULT_INVALID_SMS_FORMAT (Failed because the SMS format is not valid)"
-            SmsManager.RESULT_SYSTEM_ERROR -> "RESULT_SYSTEM_ERROR (Failed because of a system error)"
-            SmsManager.RESULT_MODEM_ERROR -> "RESULT_MODEM_ERROR (Failed because of a modem error)"
-            SmsManager.RESULT_NETWORK_ERROR -> "RESULT_NETWORK_ERROR (Failed because of a network error)"
-            SmsManager.RESULT_ENCODING_ERROR -> "RESULT_ENCODING_ERROR (Failed because of an encoding error)"
-            SmsManager.RESULT_INVALID_SMSC_ADDRESS -> "RESULT_INVALID_SMSC_ADDRESS (Failed because of an invalid SMSC address)"
-            SmsManager.RESULT_OPERATION_NOT_ALLOWED -> "RESULT_OPERATION_NOT_ALLOWED (Failed because the operation is not allowed)"
-            SmsManager.RESULT_INTERNAL_ERROR -> "RESULT_INTERNAL_ERROR (Failed because of an internal error)"
-            SmsManager.RESULT_NO_RESOURCES -> "RESULT_NO_RESOURCES (Failed because there are no resources)"
-            SmsManager.RESULT_CANCELLED -> "RESULT_CANCELLED (Failed because the operation was cancelled)"
-            SmsManager.RESULT_REQUEST_NOT_SUPPORTED -> "RESULT_REQUEST_NOT_SUPPORTED (Failed because the request is not supported)"
-            SmsManager.RESULT_NO_BLUETOOTH_SERVICE -> "RESULT_NO_BLUETOOTH_SERVICE (Failed sending via Bluetooth because the Bluetooth service is not available)"
-            SmsManager.RESULT_INVALID_BLUETOOTH_ADDRESS -> "RESULT_INVALID_BLUETOOTH_ADDRESS (Failed sending via Bluetooth because the Bluetooth device address is invalid)"
-            SmsManager.RESULT_BLUETOOTH_DISCONNECTED -> "RESULT_BLUETOOTH_DISCONNECTED (Failed sending via Bluetooth because Bluetooth disconnected)"
-            SmsManager.RESULT_UNEXPECTED_EVENT_STOP_SENDING -> "RESULT_UNEXPECTED_EVENT_STOP_SENDING (Failed because the user denied or canceled the dialog displayed for a premium shortcode SMS or rate-limited SMS)"
-            SmsManager.RESULT_SMS_BLOCKED_DURING_EMERGENCY -> "RESULT_SMS_BLOCKED_DURING_EMERGENCY (Failed sending during an emergency call)"
-            SmsManager.RESULT_SMS_SEND_RETRY_FAILED -> "RESULT_SMS_SEND_RETRY_FAILED (Failed to send an SMS retry)"
-            SmsManager.RESULT_REMOTE_EXCEPTION -> "RESULT_REMOTE_EXCEPTION (Set by BroadcastReceiver to indicate a remote exception while handling a message)"
-            SmsManager.RESULT_NO_DEFAULT_SMS_APP -> "RESULT_NO_DEFAULT_SMS_APP (Set by BroadcastReceiver to indicate there's no default SMS app)"
-            SmsManager.RESULT_RIL_RADIO_NOT_AVAILABLE -> "RESULT_RIL_RADIO_NOT_AVAILABLE (The radio did not start or is resetting)"
-            SmsManager.RESULT_RIL_SMS_SEND_FAIL_RETRY -> "RESULT_RIL_SMS_SEND_FAIL_RETRY (The radio failed to send the SMS and needs to retry)"
-            SmsManager.RESULT_RIL_NETWORK_REJECT -> "RESULT_RIL_NETWORK_REJECT (The SMS request was rejected by the network)"
-            SmsManager.RESULT_RIL_INVALID_STATE -> "RESULT_RIL_INVALID_STATE (The radio returned an unexpected request for the current state)"
-            SmsManager.RESULT_RIL_INVALID_ARGUMENTS -> "RESULT_RIL_INVALID_ARGUMENTS (The radio received invalid arguments in the request)"
-            SmsManager.RESULT_RIL_NO_MEMORY -> "RESULT_RIL_NO_MEMORY (The radio didn't have sufficient memory to process the request)"
-            SmsManager.RESULT_RIL_REQUEST_RATE_LIMITED -> "RESULT_RIL_REQUEST_RATE_LIMITED (The radio denied the operation due to overly-frequent requests)"
-            SmsManager.RESULT_RIL_INVALID_SMS_FORMAT -> "RESULT_RIL_INVALID_SMS_FORMAT (The radio returned an error indicating invalid SMS format)"
-            SmsManager.RESULT_RIL_SYSTEM_ERR -> "RESULT_RIL_SYSTEM_ERR (The radio encountered a platform or system error)"
-            SmsManager.RESULT_RIL_ENCODING_ERR -> "RESULT_RIL_ENCODING_ERR (The SMS message was not encoded properly)"
-            SmsManager.RESULT_RIL_INVALID_SMSC_ADDRESS -> "RESULT_RIL_INVALID_SMSC_ADDRESS (The specified SMSC address was invalid)"
-            SmsManager.RESULT_RIL_MODEM_ERR -> "RESULT_RIL_MODEM_ERR (The vendor RIL received an unexpected or incorrect response)"
-            SmsManager.RESULT_RIL_NETWORK_ERR -> "RESULT_RIL_NETWORK_ERR (The radio received an error from the network)"
-            SmsManager.RESULT_RIL_INTERNAL_ERR -> "RESULT_RIL_INTERNAL_ERR (The modem encountered an unexpected error scenario while handling the request)"
-            SmsManager.RESULT_RIL_REQUEST_NOT_SUPPORTED -> "RESULT_RIL_REQUEST_NOT_SUPPORTED (The request was not supported by the radio)"
-            SmsManager.RESULT_RIL_INVALID_MODEM_STATE -> "RESULT_RIL_INVALID_MODEM_STATE (The radio cannot process the request in the current modem state)"
-            SmsManager.RESULT_RIL_NETWORK_NOT_READY -> "RESULT_RIL_NETWORK_NOT_READY (The network is not ready to perform the request)"
-            SmsManager.RESULT_RIL_OPERATION_NOT_ALLOWED -> "RESULT_RIL_OPERATION_NOT_ALLOWED (The radio reports the request is not allowed)"
-            SmsManager.RESULT_RIL_NO_RESOURCES -> "RESULT_RIL_NO_RESOURCES (There are insufficient resources to process the request)"
-            SmsManager.RESULT_RIL_CANCELLED -> "RESULT_RIL_CANCELLED (The request has been cancelled)"
-            SmsManager.RESULT_RIL_SIM_ABSENT -> "RESULT_RIL_SIM_ABSENT (The radio failed to set the location where the CDMA subscription can be retrieved because the SIM or RUIM is absent)"
-            SmsManager.RESULT_RIL_SIMULTANEOUS_SMS_AND_CALL_NOT_ALLOWED -> "RESULT_RIL_SIMULTANEOUS_SMS_AND_CALL_NOT_ALLOWED (1X voice and SMS are not allowed simultaneously)"
-            SmsManager.RESULT_RIL_ACCESS_BARRED -> "RESULT_RIL_ACCESS_BARRED (Access is barred)"
-            SmsManager.RESULT_RIL_BLOCKED_DUE_TO_CALL -> "RESULT_RIL_BLOCKED_DUE_TO_CALL (SMS is blocked due to call control, e.g., resource unavailable in the SMR entity)"
-            SmsManager.RESULT_RIL_GENERIC_ERROR -> "RESULT_RIL_GENERIC_ERROR (A RIL error occurred during the SMS send)"
-            else -> "Unknown error code: $resultCode."
+            else -> "Error code: $resultCode."
         }
     }
 }
