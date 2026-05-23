@@ -20,7 +20,6 @@ import me.capcom.smsgateway.modules.messages.MessagesService
 import me.capcom.smsgateway.modules.messages.MessagesSettings
 import me.capcom.smsgateway.modules.messages.data.SendParams
 import me.capcom.smsgateway.modules.messages.data.SendRequest
-import me.capcom.smsgateway.services.PushService
 import java.util.Date
 
 class GatewayService(
@@ -43,7 +42,7 @@ class GatewayService(
     fun start(context: Context) {
         if (!settings.enabled) return
 
-        PushService.register(context)
+        // تم حذف سطر تسجيل الـ PushService لتفادي أخطاء Firebase
         PullMessagesWorker.start(context)
         WebhooksUpdateWorker.start(context)
         SettingsUpdateWorker.start(context)
@@ -308,4 +307,8 @@ class GatewayService(
             .externalIp
     }
     //endregion
+    
+    companion object {
+        private const val MODULE_NAME = "GatewayService"
+    }
 }
